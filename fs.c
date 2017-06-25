@@ -23,6 +23,17 @@
 #define min(a, b) ((a) < (b) ? (a) : (b))
 static void itrunc(struct inode*);
 
+
+struct inodestat {
+  ushort total;
+  ushort free;
+  ushort valid;
+  uint refs;
+  ushort used;
+};
+
+
+
 // Read the super block.
 void
 readsb(int dev, struct superblock *sb)
@@ -659,4 +670,21 @@ struct inode*
 nameiparent(char *path, char *name)
 {
   return namex(path, 1, name);
+}
+
+
+/*functions used to get the inodes data required by inodestat*/
+void fillInodeStat(struct inodestat* inodestat){
+  struct inode* ip;
+  inodestat->total = NINODE;
+  inodestat->free = 0;
+  inodestat->valid = 0;
+
+  acquire(&icache.lock);
+  for(ip = &icache.inode[0]; ip < &icache.inode[NINODE]; ip++){
+    if(ip->ref > 0) inodestat->refs+= ip->ref; else inodestat->free++;
+    if(ip->flags & I_VALID) inodestat->valid++;
+  }
+  release(&icache.lock);
+  inodestat->used = inodestat->total - inodestat->free;
 }

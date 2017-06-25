@@ -7,11 +7,15 @@
 #include "proc.h"
 #include "spinlock.h"
 
-struct {
+struct ptable{
   struct spinlock lock;
   struct proc proc[NPROC];
 } ptable;
 
+
+struct ptable* getPtable(){
+  return &ptable;
+}
 static struct proc *initproc;
 
 int nextpid = 1;

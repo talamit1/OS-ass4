@@ -29,11 +29,21 @@
 struct {
   struct spinlock lock;
   struct buf buf[NBUF];
-
+  uint bfree;
+  uint baccessed; // Total number of times this buffer was read from
+  uint bmiss; // Number of times this buffer was read from while B_VALID flag is off
   // Linked list of all buffers, through prev/next.
   // head.next is most recently used.
   struct buf head;
 } bcache;
+
+
+struct blockstat {
+  uint total_blocks;
+  uint free_blocks;
+  uint num_of_access;
+  uint num_of_hits;
+};
 
 void
 binit(void)
@@ -41,6 +51,9 @@ binit(void)
   struct buf *b;
 
   initlock(&bcache.lock, "bcache");
+  bcache.bfree=NBUF; //initialize bfree to all existing buffers
+  bcache.baccessed=0;//initialize baccessed 
+  bcache.bmiss=0;    //initialize bmiss
 
 //PAGEBREAK!
   // Create linked list of buffers
@@ -71,6 +84,7 @@ bget(uint dev, uint sector)
     if(b->dev == dev && b->sector == sector){
       if(!(b->flags & B_BUSY)){
         b->flags |= B_BUSY;
+        bcache.bfree--;
         release(&bcache.lock);
         return b;
       }
@@ -78,6 +92,8 @@ bget(uint dev, uint sector)
       goto loop;
     }
   }
+
+
 
   // Not cached; recycle some non-busy and clean buffer.
   // "clean" because B_DIRTY and !B_BUSY means log.c
@@ -87,6 +103,7 @@ bget(uint dev, uint sector)
       b->dev = dev;
       b->sector = sector;
       b->flags = B_BUSY;
+      bcache.bfree--;
       release(&bcache.lock);
       return b;
     }
@@ -101,8 +118,11 @@ bread(uint dev, uint sector)
   struct buf *b;
 
   b = bget(dev, sector);
-  if(!(b->flags & B_VALID))
+  bcache.baccessed++;
+  if(!(b->flags & B_VALID)){
+    bcache.bmiss++;  
     iderw(b);
+  }
   return b;
 }
 
@@ -134,10 +154,25 @@ brelse(struct buf *b)
   bcache.head.next = b;
 
   b->flags &= ~B_BUSY;
+  bcache.bfree++;
   wakeup(b);
 
   release(&bcache.lock);
 }
+
+//ths function return the blockstat of the system
+void
+getBlockstat(struct blockstat* blockstat)
+{
+  acquire(&bcache.lock);
+    blockstat->total_blocks = NBUF;
+    blockstat->free_blocks = bcache.bfree;
+    blockstat->num_of_access = bcache.baccessed;
+    blockstat->num_of_hits = (bcache.baccessed - bcache.bmiss);
+  release(&bcache.lock);
+}
+
+
 //PAGEBREAK!
 // Blank page.
 

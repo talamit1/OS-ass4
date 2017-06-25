@@ -8,12 +8,15 @@ struct rtcdate;
 struct spinlock;
 struct stat;
 struct superblock;
+struct blockstat;
+struct inodestat;
 
 // bio.c
 void            binit(void);
 struct buf*     bread(uint, uint);
 void            brelse(struct buf*);
 void            bwrite(struct buf*);
+void            getBlockstat(struct blockstat* blockstat);
 
 // console.c
 void            consoleinit(void);
@@ -51,6 +54,7 @@ struct inode*   nameiparent(char*, char*);
 int             readi(struct inode*, char*, uint, uint);
 void            stati(struct inode*, struct stat*);
 int             writei(struct inode*, char*, uint, uint);
+void 			fillInodeStat(struct inodestat* inodestat);
 
 // ide.c
 void            ideinit(void);
@@ -118,6 +122,7 @@ void            userinit(void);
 int             wait(void);
 void            wakeup(void*);
 void            yield(void);
+struct ptable*  getPtable();
 
 // procfs.c
 void 			procfsinit(void);

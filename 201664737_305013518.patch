@@ -1,0 +1,1028 @@
+diff --git a/Makefile b/Makefile
+index 4fd7e76..d85be1a 100644
+--- a/Makefile
++++ b/Makefile
+@@ -173,6 +173,8 @@ UPROGS=\
+ 	_usertests\
+ 	_wc\
+ 	_zombie\
++	_lsof\
++	_sanity\
+ 
+ fs.img: mkfs README $(UPROGS)
+ 	./mkfs fs.img README $(UPROGS)
+diff --git a/bio.c b/bio.c
+index 6a28053..4383afd 100644
+--- a/bio.c
++++ b/bio.c
+@@ -29,18 +29,31 @@
+ struct {
+   struct spinlock lock;
+   struct buf buf[NBUF];
+-
++  uint bfree;
++  uint baccessed; // Total number of times this buffer was read from
++  uint bmiss; // Number of times this buffer was read from while B_VALID flag is off
+   // Linked list of all buffers, through prev/next.
+   // head.next is most recently used.
+   struct buf head;
+ } bcache;
+ 
++
++struct blockstat {
++  uint total_blocks;
++  uint free_blocks;
++  uint num_of_access;
++  uint num_of_hits;
++};
++
+ void
+ binit(void)
+ {
+   struct buf *b;
+ 
+   initlock(&bcache.lock, "bcache");
++  bcache.bfree=NBUF; //initialize bfree to all existing buffers
++  bcache.baccessed=0;//initialize baccessed 
++  bcache.bmiss=0;    //initialize bmiss
+ 
+ //PAGEBREAK!
+   // Create linked list of buffers
+@@ -71,6 +84,7 @@ bget(uint dev, uint sector)
+     if(b->dev == dev && b->sector == sector){
+       if(!(b->flags & B_BUSY)){
+         b->flags |= B_BUSY;
++        bcache.bfree--;
+         release(&bcache.lock);
+         return b;
+       }
+@@ -79,6 +93,8 @@ bget(uint dev, uint sector)
+     }
+   }
+ 
++
++
+   // Not cached; recycle some non-busy and clean buffer.
+   // "clean" because B_DIRTY and !B_BUSY means log.c
+   // hasn't yet committed the changes to the buffer.
+@@ -87,6 +103,7 @@ bget(uint dev, uint sector)
+       b->dev = dev;
+       b->sector = sector;
+       b->flags = B_BUSY;
++      bcache.bfree--;
+       release(&bcache.lock);
+       return b;
+     }
+@@ -101,8 +118,11 @@ bread(uint dev, uint sector)
+   struct buf *b;
+ 
+   b = bget(dev, sector);
+-  if(!(b->flags & B_VALID))
++  bcache.baccessed++;
++  if(!(b->flags & B_VALID)){
++    bcache.bmiss++;  
+     iderw(b);
++  }
+   return b;
+ }
+ 
+@@ -134,10 +154,25 @@ brelse(struct buf *b)
+   bcache.head.next = b;
+ 
+   b->flags &= ~B_BUSY;
++  bcache.bfree++;
+   wakeup(b);
+ 
+   release(&bcache.lock);
+ }
++
++//ths function return the blockstat of the system
++void
++getBlockstat(struct blockstat* blockstat)
++{
++  acquire(&bcache.lock);
++    blockstat->total_blocks = NBUF;
++    blockstat->free_blocks = bcache.bfree;
++    blockstat->num_of_access = bcache.baccessed;
++    blockstat->num_of_hits = (bcache.baccessed - bcache.bmiss);
++  release(&bcache.lock);
++}
++
++
+ //PAGEBREAK!
+ // Blank page.
+ 
+diff --git a/defs.h b/defs.h
+index a9d0c14..2df29af 100644
+--- a/defs.h
++++ b/defs.h
+@@ -8,12 +8,15 @@ struct rtcdate;
+ struct spinlock;
+ struct stat;
+ struct superblock;
++struct blockstat;
++struct inodestat;
+ 
+ // bio.c
+ void            binit(void);
+ struct buf*     bread(uint, uint);
+ void            brelse(struct buf*);
+ void            bwrite(struct buf*);
++void            getBlockstat(struct blockstat* blockstat);
+ 
+ // console.c
+ void            consoleinit(void);
+@@ -51,6 +54,7 @@ struct inode*   nameiparent(char*, char*);
+ int             readi(struct inode*, char*, uint, uint);
+ void            stati(struct inode*, struct stat*);
+ int             writei(struct inode*, char*, uint, uint);
++void 			fillInodeStat(struct inodestat* inodestat);
+ 
+ // ide.c
+ void            ideinit(void);
+@@ -118,6 +122,7 @@ void            userinit(void);
+ int             wait(void);
+ void            wakeup(void*);
+ void            yield(void);
++struct ptable*  getPtable();
+ 
+ // procfs.c
+ void 			procfsinit(void);
+diff --git a/fs.c b/fs.c
+index e18786a..91a1f43 100644
+--- a/fs.c
++++ b/fs.c
+@@ -23,6 +23,17 @@
+ #define min(a, b) ((a) < (b) ? (a) : (b))
+ static void itrunc(struct inode*);
+ 
++
++struct inodestat {
++  ushort total;
++  ushort free;
++  ushort valid;
++  uint refs;
++  ushort used;
++};
++
++
++
+ // Read the super block.
+ void
+ readsb(int dev, struct superblock *sb)
+@@ -660,3 +671,20 @@ nameiparent(char *path, char *name)
+ {
+   return namex(path, 1, name);
+ }
++
++
++/*functions used to get the inodes data required by inodestat*/
++void fillInodeStat(struct inodestat* inodestat){
++  struct inode* ip;
++  inodestat->total = NINODE;
++  inodestat->free = 0;
++  inodestat->valid = 0;
++
++  acquire(&icache.lock);
++  for(ip = &icache.inode[0]; ip < &icache.inode[NINODE]; ip++){
++    if(ip->ref > 0) inodestat->refs+= ip->ref; else inodestat->free++;
++    if(ip->flags & I_VALID) inodestat->valid++;
++  }
++  release(&icache.lock);
++  inodestat->used = inodestat->total - inodestat->free;
++}
+diff --git a/ls.c b/ls.c
+index b6ddd7f..64a18ca 100644
+--- a/ls.c
++++ b/ls.c
+@@ -46,6 +46,7 @@ ls(char *path)
+     printf(1, "%s %d %d %d\n", fmtname(path), st.type, st.ino, st.size);
+     break;
+   
++  case T_DEV:
+   case T_DIR:
+     if(strlen(path) + 1 + DIRSIZ + 1 > sizeof buf){
+       printf(1, "ls: path too long\n");
+@@ -59,6 +60,7 @@ ls(char *path)
+         continue;
+       memmove(p, de.name, DIRSIZ);
+       p[DIRSIZ] = 0;
++      //printf(2,"bufff is%s\n",buf);
+       if(stat(buf, &st) < 0){
+         printf(1, "ls: cannot stat %s\n", buf);
+         continue;
+diff --git a/lsof.c b/lsof.c
+new file mode 100644
+index 0000000..71becbd
+--- /dev/null
++++ b/lsof.c
+@@ -0,0 +1,102 @@
++#include "types.h"
++#include "stat.h"
++#include "user.h"
++#include "fs.h"
++
++#define BSIZE      512
++#define MAXPATHLEN 512
++#define NOFILE     16
++
++
++struct fdData {
++  uint type;
++  int ref; // reference count
++  char readable;
++  char writable;
++  uint inum;
++  uint off;
++};
++
++int
++itoa(int num, char *str)
++{
++  int temp, len, i;
++	temp = num;
++	len = 1;
++	while (temp/10!=0){
++		len++;
++		temp /= 10;
++	}
++  if(len > DIRSIZ){
++    return -1;
++  }
++	for (i = len; i > 0; i--){
++		str[i-1] = (num%10)+48;
++		num/=10;
++	}
++	str[len]='\0';
++
++  return len;
++}
++
++void
++printLsofPID(struct dirent* de)
++{
++  char path[MAXPATHLEN];
++  char *p;
++  int fd,i;
++  struct fdData fdData;
++  char* file_types[]= { "FD_NONE", "FD_PIPE", "FD_INODE" };
++
++  strcpy(path, "/proc/");
++  p = path + strlen(path);
++  strcpy(p, de->name);
++  p = path + strlen(path);
++  strcpy(p, "/fdinfo/");
++  p = path + strlen(path);
++
++  for(i=0; i<NOFILE; i++){
++    itoa(i, p);
++
++    if((fd = open(path, 0)) < 0){
++      continue;
++    }
++
++    read(fd, &fdData, sizeof(fdData));
++
++    printf(1,"%s\t%d\t%d\t%d\t%s\n", de->name, i, fdData.ref, fdData.inum, file_types[fdData.type]);
++  	
++
++    close(fd);
++
++  }
++}
++
++
++int
++main(int argc, char *argv[])
++{
++  struct dirent de;
++  int fdproc, i;
++
++  if((fdproc = open("proc", 0)) < 0){
++    printf(1, "lsof: cannot open proc\n");
++    return -1;
++  }
++
++  for(i=0; i<4; i++){ //Reading the first irelevent dirents
++    read(fdproc, &de, sizeof(de));
++  }
++
++  while(read(fdproc, &de, sizeof(de)) == sizeof(de)){
++    if(de.inum == 0)
++      continue;
++  	printf(1,"%s\n","FD INFO:");
++    printLsofPID(&de);
++
++  }
++
++  close(fdproc);
++
++  exit();
++} 
+diff --git a/mkfs.c b/mkfs.c
+index c168377..4b9db3f 100644
+--- a/mkfs.c
++++ b/mkfs.c
+@@ -11,7 +11,7 @@
+ #include "stat.h"
+ #include "param.h"
+ 
+-#define static_assert(a, b) do { switch (0) case 0: case (a): ; } while (0)
++/*#define static_assert(a, b) do { switch (0) case 0: case (a): ; } while (0)*/
+ 
+ int nblocks = (995-LOGSIZE);
+ int nlog = LOGSIZE;
+diff --git a/proc.c b/proc.c
+index a642f5a..1964674 100644
+--- a/proc.c
++++ b/proc.c
+@@ -7,11 +7,15 @@
+ #include "proc.h"
+ #include "spinlock.h"
+ 
+-struct {
++struct ptable{
+   struct spinlock lock;
+   struct proc proc[NPROC];
+ } ptable;
+ 
++
++struct ptable* getPtable(){
++  return &ptable;
++}
+ static struct proc *initproc;
+ 
+ int nextpid = 1;
+diff --git a/procfs.c b/procfs.c
+index 23301b0..b2461f2 100644
+--- a/procfs.c
++++ b/procfs.c
+@@ -1,3 +1,4 @@
++
+ #include "types.h"
+ #include "stat.h"
+ #include "defs.h"
+@@ -11,26 +12,544 @@
+ #include "proc.h"
+ #include "x86.h"
+ 
++
++#define BLOCKSTATINUM 201
++#define INODESTATINUM 202
++#define PROCDIRINUM	  300
++#define PROCDIR         0
++#define	PROC_STATUS     1
++#define PROC_CWD   	    2
++#define PROC_FDINFO     3
++#define FIRST_FD_FILE   4
++#define LAST_FD_FILE   19
++
++
++
++
++  static char *states[] = {
++    [UNUSED]    "unused",
++    [EMBRYO]    "embryo",
++    [SLEEPING]  "sleep ",
++    [RUNNABLE]  "runble",
++    [RUNNING]   "run   ",
++    [ZOMBIE]    "zombie"
++  };  
++
++
++struct fd {
++  uint type;
++  int ref; // reference count
++  char readable;
++  char writable;
++  uint inum;
++  uint off;
++};
++
++struct ptable{
++  struct spinlock lock;
++  struct proc proc[NPROC];
++} ptable;
++
++struct blockstat {
++  uint total_blocks;
++  uint free_blocks;
++  uint num_of_access;
++  uint num_of_hits;
++};
++
++struct proc_stat{
++  enum procstate state;
++  uint size;
++
++};
++
++struct inodestat {
++  ushort total;
++  ushort free;
++  ushort valid;
++  uint refs;
++  ushort used;
++};
++
++int whichProcFile(int inum ,int type);
++int isFDFile(int inum);
++int procRead(struct inode* ip,char *dst,int off,int n);
++int inodestatRead(struct inode* ip,char *dst,int off,int n);
++int procPIDDirRead(struct inode* ip,char *dst,int off,int n);
++int blockstatRead(struct inode* ip,char *dst,int off,int n);
++//int readProcCWD(struct inode* ip,char *dst,int off,int n);
++int readProcStat(struct inode* ip,char *dst,int off,int n);
++int readProcFdinfo(struct inode* ip,char *dst,int off,int n);
++int readProcFdFile(struct inode* ip,char *dst,int off,int n);
++int itoa(int num, char *str);
++int adjustRead(void* buf, uint bytes_read, char *dst, int off, int n);
++void blockstatToString(struct blockstat* blockstat,char* buffer);
++void inodestatToString(struct inodestat* inodestat,char* buffer);
++void statusToString(struct proc_stat* ps,char* buf);
++
++
++
++
+ int 
+ procfsisdir(struct inode *ip) {
+-  return 0;
++  //cprintf("checking inod number:%d\n",ip->inum );
++  int ans=ip->type==T_DEV&&
++  ip->major==PROCFS && 
++  		 (whichProcFile(ip->inum,PROCDIR)|| 
++  		  whichProcFile(ip->inum,PROC_FDINFO)||
++  		 namei("proc")->inum == ip->inum);
++  //cprintf("ans is: %d\n",ans );
++  return ans;
+ }
+ 
+ void 
+ procfsiread(struct inode* dp, struct inode *ip) {
++	if(ip->inum<200)
++		return;
++	ip->type=T_DEV;
++	ip->major=PROCFS;
++	ip->flags|=I_VALID;
++
++
+ }
+ 
+ int
+ procfsread(struct inode *ip, char *dst, int off, int n) {
++	
++	if(namei("proc")->inum==ip->inum)
++		return procRead(ip,dst,off,n); //working good
++
++	else if(ip->inum==BLOCKSTATINUM)
++		return blockstatRead(ip,dst,off,n); //working good
++		
++	else if(ip->inum==INODESTATINUM)
++		return inodestatRead(ip,dst,off,n);	//working good
++
++	else if(whichProcFile(ip->inum,PROCDIR))
++		return procPIDDirRead(ip,dst,off,n);
++
++	else if(whichProcFile(ip->inum,PROC_STATUS))
++		return readProcStat(ip,dst,off,n);
++		
++
++	else if(whichProcFile(ip->inum,PROC_CWD))
++		//return readProcCWD(ip,dst,off,n);
++		return 0;
++
++	else if(whichProcFile(ip->inum,PROC_FDINFO))
++		return readProcFdinfo(ip,dst,off,n);
++
++	else if(isFDFile(ip->inum))
++		return readProcFdFile(ip,dst,off,n);
++		//return 0;
++
++  panic("unknown file type");
++
+   return 0;
+ }
+ 
++int whichProcFile(int inum ,int type){
++	int ans=0;
++	for(int i=0;i<64;i++){
++		if(inum==PROCDIRINUM+type+100*i)
++			ans= 1;
++	}
++	return ans;
++}
++
++int isFDFile(int inum){
++	if(inum > 300 && inum < 6900){
++		return ((inum % 100) < 20 && (inum%100) > 3);
++	}
++	return 0;
++}
++
++
++
+ int
+ procfswrite(struct inode *ip, char *buf, int n)
+ {
++  panic("tring to write to a read-only device");
++  return 0;
++}
++
++
++
++/*-------------------------------start of imnplemntung the cases functions---------------*/
++
++/*----------------------PROC DEVICE ROOT FOLDER-------------------*/
++int procRead(struct inode* ip,char *dst,int off,int n){
++	struct proc* p;
++  	struct ptable* pt;
++	struct dirent dirent;
++	int i;
++
++	uint curr_proc=4;
++	uint ind=off/sizeof(dirent);
++
++	switch(ind){
++
++	//currentDir
++	case 0:
++
++		dirent.inum=ip->inum;
++		strncpy(dirent.name, ".",sizeof("."));
++		break;
++	//Parent Directory
++	case 1:
++		dirent.inum=namei("/")->inum;
++		strncpy(dirent.name,"..",strlen(".."));
++		break;
++	//Blockstat case
++	case 2:
++		dirent.inum=BLOCKSTATINUM;
++		strncpy(dirent.name,"blockstat",strlen("blockstat"));
++		break;
++	//inode stat cas
++	case 3:
++		dirent.inum=INODESTATINUM;
++		strncpy(dirent.name,"inodestat",strlen("inodestat"));
++		break;
++
++	//proc folders case
++	default:
++		pt = getPtable();
++		acquire(&pt->lock);
++		for(i=0;i<NPROC;i++){
++			p=pt->proc +i;
++		 	if(p->state != UNUSED && p->state != ZOMBIE && ind == curr_proc++){
++		 		if(itoa(p->pid,dirent.name)==-1)
++		 			panic("itoa failed");
++		 		dirent.inum=PROCDIRINUM+i*100;
++		 		break;
++			}
++		}
++		
++		release(&pt->lock);
++      		if(i >= NPROC)
++       		 return 0;
++	}
++
++	memmove(dst,&dirent,n);
++	return n;
++}
++/*----------------------PROC NUM PID DIR READ-------------------*/
++int procPIDDirRead(struct inode* ip,char *dst,int off,int n){
++	struct proc* p;
++  	struct ptable* pt;
++	struct dirent dirent;
++	int index;
++	pt = getPtable();
++	
++	if(off == 0){
++      index = 0;
++  } else
++      index = off/sizeof(dirent);
++
++
++	switch(index){
++		//current dir case
++		case 0:
++			dirent.inum=ip->inum;
++			strncpy(dirent.name, ".",sizeof("."));
++			break;
++		//parent dir case
++		case 1:
++			dirent.inum = namei("proc")->inum;
++			strncpy(dirent.name,"..\0",sizeof(".."));
++			break;
++		//cwd
++		case 2:
++			acquire(&pt->lock);
++			p=pt->proc+ ((ip->inum - PROCDIRINUM) /100);
++			if(p->state == UNUSED || p->state == ZOMBIE){
++				release(&pt->lock);
++			    return 0;
++			}
++			dirent.inum=p->cwd->inum;
++			release(&pt->lock);
++			strncpy(dirent.name,"cwd",sizeof("cwd"));
++			break;
++		//fdinfo
++		case 3:
++			acquire(&pt->lock);
++			p=pt->proc + ((ip->inum-PROCDIRINUM)/100);
++			if(p->state == UNUSED || p->state == ZOMBIE){
++				release(&pt->lock);
++			    return 0;
++			}
++			strncpy(dirent.name,"fdinfo",sizeof("fdinfo"));
++			dirent.inum=ip->inum+PROC_FDINFO;
++			release(&pt->lock);
++			break;
++		//status case
++		case 4:
++			acquire(&pt->lock);
++			p=pt->proc+ ((ip->inum-PROCDIRINUM) /100);
++			if(p->state == UNUSED || p->state == ZOMBIE){
++				release(&pt->lock);
++			    return 0;
++			}
++			strncpy(dirent.name,"status",sizeof("status"));
++			dirent.inum=ip->inum+PROC_STATUS;
++			release(&pt->lock);
++			break;
++		default:
++			 return 0;
++		}
++	
++	memmove(dst,&dirent,n);
++	return n;
++}
++/*----------------------END OF PROC NUM PID DIR READ-------------------*/
++
++
++/*----------------------FDINFO FOKDER READ-------------------*/
++int readProcFdinfo(struct inode* ip,char *dst,
++					int off,int n){
++  struct dirent dirent;
++  uint index, fd, proc_num;
++  struct ptable* pt;
++  struct proc* p;
++  int count_fds=2;
++
++    if(off == 0){
++      index = 0;
++  	} 
++  else
++      index = off/sizeof(dirent);
++
++  switch(index){
++	//current dir case
++	case 0:
++		dirent.inum=ip->inum;
++		strncpy(dirent.name, ".",sizeof("."));
++		break;
++	//parent dit case
++	case 1:
++		dirent.inum=ip->inum - PROCDIRINUM - PROC_FDINFO;
++		strncpy(dirent.name,"..",sizeof(".."));
++		break;
++
++	default:
++		proc_num= (ip->inum- PROCDIRINUM - PROC_FDINFO)/100;
++		pt=getPtable();
++		acquire(&pt->lock);
++		p=pt->proc+proc_num;
++		if(p->state == UNUSED || p->state == ZOMBIE){
++			release(&pt->lock);
++	    	return 0;
++		}
++		for(fd = 0; fd<NOFILE; fd++){
++        if(p->ofile[fd] && p->ofile[fd]->type==FD_INODE && index == count_fds++){
++          if(itoa(fd, dirent.name) == -1)
++            panic("procfsread: pid exceeds the max number of digits");
++          dirent.inum = ip->inum+1+fd;    //initial fd files inodes
++          break;
++        }
++      }
++      release(&pt->lock);
++      if(fd >= NOFILE)
++        return 0;
++   }
++  memmove(dst, &dirent , n);
++  return n;
++}
++/*----------------------END OF FDINFO FOKDER READ-------------------*/
++
++
++/*----------------------BLOCKSTAT READ-------------------*/
++int blockstatRead(struct inode *ip, char *dst, int off, int n)
++{
++
++  char buffer[BSIZE];
++  struct blockstat blockstat;
++  getBlockstat(&blockstat);
++
++  blockstatToString(&blockstat,buffer);
++ 	
++
++  return adjustRead(buffer, strlen(buffer), dst, off, n);
++ }
++
++ void blockstatToString(struct blockstat* blockstat,char* buffer){
++  char free_blocks[11];
++  char total_blocks[11];
++  char hit_ratio[24];
++
++  int free_blocks_length = itoa(blockstat->free_blocks, free_blocks);
++  int total_blocks_length = itoa(blockstat->total_blocks, total_blocks);
++
++  int hit_ratio_length = itoa(blockstat->num_of_hits, hit_ratio);
++  strncpy(hit_ratio+hit_ratio_length, " / ", 3);
++  hit_ratio_length += 3;
++  hit_ratio_length += itoa(blockstat->num_of_access, hit_ratio + hit_ratio_length);
++
++  strncpy(buffer, "Free Blocks: ", 14);
++  strncpy(buffer+strlen(buffer), free_blocks, free_blocks_length+1);
++  strncpy(buffer+strlen(buffer), "\n", 2);
++  strncpy(buffer+strlen(buffer), "Total Blocks: ", 15);
++  strncpy(buffer+strlen(buffer), total_blocks, total_blocks_length+1);
++  strncpy(buffer+strlen(buffer), "\n", 2);
++  strncpy(buffer+strlen(buffer), "Hit Ratio: ", 12);
++  strncpy(buffer+strlen(buffer), hit_ratio, hit_ratio_length+1);
++  strncpy(buffer+strlen(buffer), "\n", 2);
++ }
++ /*----------------------END OF BLOCKSTAT READ-------------------*/
++
++/*----------------------INODESTAT READ-------------------*/
++int inodestatRead (struct inode *ip, char *dst, int off, int n){
++  struct inodestat inodestat;
++  char buffer[BSIZE];
++  fillInodeStat(&inodestat);
++  inodestatToString(&inodestat,buffer);
++  return adjustRead(buffer, strlen(buffer), dst, off, n);
++}
++
++
++void inodestatToString(struct inodestat* inodestat,char* buffer){
++  char free_inodes[3];
++  char valid_inodes[3];
++  char refs_per_inode[16];
++
++  int free_inodes_length = itoa(inodestat->free, free_inodes);
++  int valid_inodes_length = itoa(inodestat->valid, valid_inodes);
++
++  int refs_per_inode_length = itoa(inodestat->refs, refs_per_inode);
++  strncpy(refs_per_inode+refs_per_inode_length, " / ", 3);
++  refs_per_inode_length += 3;
++  refs_per_inode_length += itoa(inodestat->used, refs_per_inode + refs_per_inode_length);
++
++  strncpy(buffer, "Free Inodes: ", 14);
++  strncpy(buffer+strlen(buffer), free_inodes, free_inodes_length+1);
++  strncpy(buffer+strlen(buffer), "\n", 2);
++  strncpy(buffer+strlen(buffer), "Valid Inodes: ", 15);
++  strncpy(buffer+strlen(buffer), valid_inodes, valid_inodes_length+1);
++  strncpy(buffer+strlen(buffer), "\n", 2);
++  strncpy(buffer+strlen(buffer), "Refs Per Inode: ", 17);
++  strncpy(buffer+strlen(buffer), refs_per_inode, refs_per_inode_length+1);
++  strncpy(buffer+strlen(buffer), "\n", 2);
++}
++
++/*----------------------END OF INODESTAT READ-------------------*/
++
++
++/*-----------------PROC/PID/STATUS case------------------*/
++int readProcStat(struct inode* ip,char *dst,int off,int n){
++  struct ptable* pt;
++  struct proc* p;
++  struct proc_stat procstat;
++  pt=getPtable();
++  acquire(&pt->lock);
++  	p=pt->proc+ (ip->inum -PROCDIRINUM - PROC_STATUS)/100;        //convert the inum in to the ptable index and add it to ptable to get proc
++  	procstat.size=p->sz;
++  	procstat.state=p->state;
++  release(&pt->lock);
++  
++  char buf[BSIZE];
++
++  statusToString(&procstat,buf);
++
++  return adjustRead(buf,strlen(buf),dst,off,n);
++}
++
++void statusToString(struct proc_stat* pstatus,char* buffer){
++	
++	char* firstStr="process is in state: ";
++	char* secondstr="process size is: ";
++
++  char proc_size[11];
++  int proc_size_length = itoa(pstatus->size, proc_size);
++
++  strncpy(buffer, firstStr, strlen(firstStr)+1);
++  strncpy(buffer+strlen(buffer), states[pstatus->state], strlen(states[pstatus->state])+1);
++  strncpy(buffer+strlen(buffer), "\n", 2);
++  strncpy(buffer+strlen(buffer), secondstr, strlen(secondstr)+1);
++  strncpy(buffer+strlen(buffer), proc_size, proc_size_length+1);
++  strncpy(buffer+strlen(buffer), "\n", 2);
++
++
++}
++/*-----------------END OF PROC/PID/STATUS case------------------*/
++
++
++
++
++
++int adjustRead(void* buf, uint bytes_read, char *dst, int off, int n)
++{
++  int bytes_to_send = 0;
++  if (off < bytes_read) {
++    bytes_to_send = bytes_read - off;
++    if (bytes_to_send < n) {
++      memmove(dst,(char*)buf+off,bytes_to_send);
++      return bytes_read;
++    }
++    memmove(dst,(char*)buf+off,n);
++    return n;
++  }
+   return 0;
+ }
+ 
++
++
++int
++itoa(int num, char *str)
++{
++  int temp, len, i;
++	temp = num;
++	len = 1;
++	while (temp/10!=0){
++		len++;
++		temp /= 10;
++	}
++  if(len > DIRSIZ){
++    cprintf("pidToString: Directory name should not exceed %d characters but this PID exceeds %d digits", DIRSIZ, DIRSIZ);
++    return -1;
++  }
++	for (i = len; i > 0; i--){
++		str[i-1] = (num%10)+48;
++		num/=10;
++	}
++	str[len]='\0';
++
++  return len;
++}
++
++
++int readProcFdFile(struct inode* ip,char *dst,int off,int n){
++  uint  fdInd;
++  struct proc* p;
++  fdInd=(ip->inum%100)-PROC_FDINFO-1;
++   //cprintf("readProcFdFile !! inod number is:%d\n",ip->inum);
++   //cprintf("readProcFdFile !! fdInd is:%d\n",fdInd);
++  struct ptable* pt;
++  struct file* fd;
++  struct fd pfd;
++  pt = getPtable();
++  acquire(&pt->lock);
++  	p=pt->proc + (ip->inum - PROCDIRINUM - PROC_FDINFO -fdInd+1)/100;
++  	if(p->state == UNUSED || p->state == ZOMBIE){
++      release(&pt->lock);
++      return 0;
++    }
++    fd = p->ofile[fdInd];
++    pfd.type = fd->type;
++    pfd.ref = fd->ref;
++    pfd.readable = fd->readable;
++    pfd.writable = fd->writable;
++    if(fd->type == FD_INODE)
++      pfd.inum = fd->ip->inum;
++    pfd.off = fd->off;
++  release(&pt->lock);
++
++
++   return(adjustRead(&pfd,sizeof(pfd),dst,off,n));
++}
++
++
++
++
+ void
+ procfsinit(void)
+ {
+@@ -39,3 +558,5 @@ procfsinit(void)
+   devsw[PROCFS].write = procfswrite;
+   devsw[PROCFS].read = procfsread;
+ }
++
++
+diff --git a/sanity.c b/sanity.c
+new file mode 100644
+index 0000000..57ae135
+--- /dev/null
++++ b/sanity.c
+@@ -0,0 +1,89 @@
++ 
++#include "types.h"
++#include "stat.h"
++#include "user.h"
++#include "fs.h"
++
++int
++intToString(int num, char *str)
++{
++  int temp, len, i;
++	temp = num;
++	len = 1;
++	while (temp/10!=0){
++		len++;
++		temp /= 10;
++	}
++  if(len > DIRSIZ){
++    return -1;
++  }
++	for (i = len; i > 0; i--){
++		str[i-1] = (num%10)+48;
++		num/=10;
++	}
++	str[len]='\0';
++
++  return len;
++}
++
++int
++main(int argc, char *argv[])
++{
++
++	int n = 5, k = 3;
++	int ppid = getpid();
++
++	if(fork()){
++		for (int i = 0; i < n; i++){
++			if(!fork()){
++				// sleep(i*100);
++				char path1[512];
++				char path2[512];
++				int pid = getpid();
++				int fdinodestat = open("/proc/inodestat", 0);
++				int fdblockstat = open("/proc/blockstat", 0);
++				strcpy(path1, "/proc/");
++				intToString(ppid, path1+strlen(path1));
++				int fdpid = open(path1, 0);
++				strcpy(path2, "/proc/");
++				intToString(pid , path2+strlen(path2));
++				fdpid = open(path2, 0);
++				while(k){
++					if(fork()){
++						wait();
++						k = 0;
++					}
++					else if(k){
++						k--;
++					}
++				}
++				sleep(i*100);
++				close(fdinodestat);
++				close(fdblockstat);
++				close(fdpid);
++				exit();
++			}
++		}
++		for (int i = 0; i < n; i++){
++			wait();
++		}
++	}
++	else{
++		for (int i = 0; i < n; i++){
++			if(fork()){
++				sleep(i*100);
++				wait();
++			}
++			else{
++				sleep(i*100);
++				printf(1,"\n\n!! lsof %d:\n",i);
++				exec("lsof",argv);
++				exit();
++			}
++		}
++		exit();
++	}
++
++	wait();
++	exit();
++}
+\ No newline at end of file
+diff --git a/ulib.c b/ulib.c
+index dbbcfcf..0352725 100644
+--- a/ulib.c
++++ b/ulib.c
+@@ -74,8 +74,10 @@ stat(char *n, struct stat *st)
+   int r;
+ 
+   fd = open(n, O_RDONLY);
+-  if(fd < 0)
++  if(fd < 0){
++    printf(1,"path is :%s\n",n);
+     return -1;
++  }
+   r = fstat(fd, st);
+   close(fd);
+   return r;
